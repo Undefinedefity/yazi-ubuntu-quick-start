@@ -2,9 +2,8 @@
 
 set -euo pipefail
 
-PACKAGE_DIR_NAME="yazi-x86_64-unknown-linux-gnu"
 INSTALL_ROOT="${HOME}/.local/opt"
-INSTALL_DIR="${INSTALL_ROOT}/${PACKAGE_DIR_NAME}"
+INSTALL_DIR="${INSTALL_ROOT}/yazi"
 BIN_DIR="${HOME}/.local/bin"
 CHANGES=0
 

@@ -2,15 +2,10 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-FLOW_FILE="${SCRIPT_DIR}/flow.MD"
-ARCHIVE_NAME="yazi-x86_64-unknown-linux-gnu.zip"
-PACKAGE_DIR_NAME="yazi-x86_64-unknown-linux-gnu"
-LOCAL_ARCHIVE="${SCRIPT_DIR}/${ARCHIVE_NAME}"
-LOCAL_PACKAGE_DIR="${SCRIPT_DIR}/${PACKAGE_DIR_NAME}"
 INSTALL_ROOT="${HOME}/.local/opt"
-INSTALL_DIR="${INSTALL_ROOT}/${PACKAGE_DIR_NAME}"
+INSTALL_DIR="${INSTALL_ROOT}/yazi"
 BIN_DIR="${HOME}/.local/bin"
+TARGET_VERSION=""
 TMP_DIR=""
 
 cleanup() {
@@ -43,110 +38,79 @@ run_as_root() {
   sudo "$@"
 }
 
-ensure_packages() {
-  local packages=()
-  local need_unzip=0
-
-  if [[ -f "${LOCAL_ARCHIVE}" || ! -d "${LOCAL_PACKAGE_DIR}" ]]; then
-    need_unzip=1
+check_system() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    fail "此脚本仅支持 Linux 系统，当前为 $(uname -s)"
   fi
-
-  if [[ "${need_unzip}" -eq 1 ]] && ! command -v unzip >/dev/null 2>&1; then
-    packages+=("unzip")
-  fi
-
-  if [[ ! -f "${LOCAL_ARCHIVE}" && ! -d "${LOCAL_PACKAGE_DIR}" ]]; then
-    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-      packages+=("curl")
-    fi
-  fi
-
-  if [[ "${#packages[@]}" -eq 0 ]]; then
-    return
-  fi
-
-  log "安装缺失依赖: ${packages[*]}"
-  run_as_root apt-get update
-  run_as_root apt-get install -y "${packages[@]}"
 }
 
-check_system() {
-  if [[ ! -r /etc/os-release ]]; then
-    fail "无法读取 /etc/os-release，无法确认系统版本"
-  fi
-
-  # shellcheck disable=SC1091
-  source /etc/os-release
-
-  if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "24.04" ]]; then
-    fail "此脚本仅支持 Ubuntu 24.04，当前为 ${ID:-unknown} ${VERSION_ID:-unknown}"
-  fi
-
+detect_arch() {
   case "$(uname -m)" in
-    x86_64|amd64)
-      ;;
-    *)
-      fail "此脚本仅支持 x86_64，当前架构为 $(uname -m)"
-      ;;
+    x86_64|amd64)   printf 'x86_64-unknown-linux-gnu' ;;
+    aarch64|arm64)  printf 'aarch64-unknown-linux-gnu' ;;
+    i686|i386)      printf 'i686-unknown-linux-gnu' ;;
+    riscv64)        printf 'riscv64gc-unknown-linux-gnu' ;;
+    sparc64)        printf 'sparc64-unknown-linux-gnu' ;;
+    *)              fail "不支持的架构: $(uname -m)" ;;
   esac
 }
 
-resolve_download_url() {
-  local url=""
-
-  if [[ -f "${FLOW_FILE}" ]]; then
-    url="$(
-      awk '/^https:\/\/github\.com\/sxyazi\/yazi\/releases\/download\/[^[:space:]]+\/yazi-x86_64-unknown-linux-gnu\.zip$/ { print; exit }' "${FLOW_FILE}"
-    )"
-  fi
-
-  if [[ -z "${url}" ]]; then
-    url="https://github.com/sxyazi/yazi/releases/download/v26.1.22/yazi-x86_64-unknown-linux-gnu.zip"
-  fi
-
-  printf '%s\n' "${url}"
-}
-
-download_archive() {
-  local url="$1"
-  local target="$2"
-
-  log "未发现本地压缩包，开始下载: ${url}"
-
-  if command -v curl >/dev/null 2>&1; then
-    curl -fL --retry 3 --output "${target}" "${url}"
+resolve_version() {
+  if [[ -n "${TARGET_VERSION}" ]]; then
+    printf '%s\n' "${TARGET_VERSION}"
     return
   fi
 
-  if command -v wget >/dev/null 2>&1; then
-    wget -O "${target}" "${url}"
-    return
+  local ver=""
+  ver="$(
+    curl -fsSL --max-time 10 \
+      'https://api.github.com/repos/sxyazi/yazi/releases/latest' 2>/dev/null \
+      | grep '"tag_name"' \
+      | head -1 \
+      | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
+  )" || true
+
+  if [[ -z "${ver}" ]]; then
+    ver="v26.1.22"
+    log "无法从 GitHub API 获取最新版本，使用内置版本: ${ver}"
   fi
 
-  fail "缺少 curl/wget，无法下载压缩包"
+  printf '%s\n' "${ver}"
 }
 
-prepare_source_tree() {
+ensure_packages() {
+  local packages=()
+
+  command -v unzip >/dev/null 2>&1 || packages+=("unzip")
+  command -v curl  >/dev/null 2>&1 || packages+=("curl")
+
+  [[ "${#packages[@]}" -eq 0 ]] && return
+
+  if command -v apt-get >/dev/null 2>&1; then
+    log "安装缺失依赖: ${packages[*]}"
+    run_as_root apt-get update
+    run_as_root apt-get install -y "${packages[@]}"
+  else
+    fail "缺少以下依赖，请手动安装后重试: ${packages[*]}"
+  fi
+}
+
+download_and_extract() {
+  local arch version archive_name url
+
+  arch="$(detect_arch)"
+  version="$(resolve_version)"
+  archive_name="yazi-${arch}.zip"
+  url="https://github.com/sxyazi/yazi/releases/download/${version}/${archive_name}"
+
   TMP_DIR="$(mktemp -d)"
 
-  if [[ -f "${LOCAL_ARCHIVE}" ]]; then
-    log "使用本地压缩包: ${LOCAL_ARCHIVE}"
-    unzip -oq "${LOCAL_ARCHIVE}" -d "${TMP_DIR}"
-    printf '%s\n' "${TMP_DIR}/${PACKAGE_DIR_NAME}"
-    return
-  fi
+  log "下载 Yazi ${version} (${arch})..."
+  curl -fL --retry 3 --output "${TMP_DIR}/${archive_name}" "${url}"
 
-  if [[ -d "${LOCAL_PACKAGE_DIR}" ]]; then
-    log "本地压缩包不存在，使用已解压目录: ${LOCAL_PACKAGE_DIR}"
-    cp -a "${LOCAL_PACKAGE_DIR}" "${TMP_DIR}/"
-    printf '%s\n' "${TMP_DIR}/${PACKAGE_DIR_NAME}"
-    return
-  fi
+  unzip -oq "${TMP_DIR}/${archive_name}" -d "${TMP_DIR}"
 
-  local downloaded_archive="${TMP_DIR}/${ARCHIVE_NAME}"
-  download_archive "$(resolve_download_url)" "${downloaded_archive}"
-  unzip -oq "${downloaded_archive}" -d "${TMP_DIR}"
-  printf '%s\n' "${TMP_DIR}/${PACKAGE_DIR_NAME}"
+  printf '%s\n' "${TMP_DIR}/yazi-${arch}"
 }
 
 backup_target_if_needed() {
@@ -162,7 +126,7 @@ backup_target_if_needed() {
 install_files() {
   local source_dir="$1"
 
-  [[ -x "${source_dir}/ya" ]] || chmod +x "${source_dir}/ya"
+  [[ -x "${source_dir}/ya"   ]] || chmod +x "${source_dir}/ya"
   [[ -x "${source_dir}/yazi" ]] || chmod +x "${source_dir}/yazi"
 
   mkdir -p "${INSTALL_ROOT}" "${BIN_DIR}"
@@ -172,7 +136,7 @@ install_files() {
   backup_target_if_needed "${BIN_DIR}/ya"
   backup_target_if_needed "${BIN_DIR}/yazi"
 
-  ln -sfn "${INSTALL_DIR}/ya" "${BIN_DIR}/ya"
+  ln -sfn "${INSTALL_DIR}/ya"   "${BIN_DIR}/ya"
   ln -sfn "${INSTALL_DIR}/yazi" "${BIN_DIR}/yazi"
 }
 
@@ -241,12 +205,44 @@ EOF
   print_path_fix_instructions
 }
 
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --version|-v)
+        [[ $# -ge 2 ]] || fail "--version 需要一个参数 (例: v26.1.22)"
+        TARGET_VERSION="$2"
+        shift 2
+        ;;
+      --help|-h)
+        cat <<EOF
+用法: install.sh [选项]
+
+选项:
+  --version, -v <版本>  安装指定版本 (例: v26.1.22)，默认安装最新版本
+  --help, -h            显示此帮助
+
+示例:
+  bash install.sh
+  bash install.sh --version v26.1.22
+  curl -fsSL https://raw.githubusercontent.com/Undefinedefity/yazi-ubuntu-quick-start/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/Undefinedefity/yazi-ubuntu-quick-start/main/install.sh | bash -s -- --version v26.1.22
+EOF
+        exit 0
+        ;;
+      *)
+        fail "未知参数: $1"
+        ;;
+    esac
+  done
+}
+
 main() {
+  parse_args "$@"
   check_system
   ensure_packages
 
   local source_dir
-  source_dir="$(prepare_source_tree)"
+  source_dir="$(download_and_extract)"
 
   if [[ ! -f "${source_dir}/yazi" || ! -f "${source_dir}/ya" ]]; then
     fail "安装源目录不完整: ${source_dir}"
